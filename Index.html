@@ -1,0 +1,181 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.37;
+
+contract ZenithPixelAdAuction {
+    struct AdSlot {
+        address payable currentOwner;
+        uint256 currentBidWei;
+        uint256 buyNowPriceWei;
+        bool isActive;
+        bytes32 contentHash;
+    }
+
+    address payable public immutable auctionAdmin;
+    string public engineDescriptor;
+    uint256 public platformFeeBps; // 250 = 2.5%
+    uint256 public slotCounter;
+    uint256 public accumulatedFees;
+    bool public isEnginePaused;
+
+    mapping(uint256 => AdSlot) public adSlots;
+    mapping(address => uint256) public pendingRefunds;
+
+    event SlotAdded(uint256 indexed slotId, uint256 buyNowPrice);
+    event SlotBoughtOutright(uint256 indexed slotId, address indexed buyer, uint256 amount);
+    event RefundClaimed(address indexed bidder, uint256 amount);
+    event TreasuryDrained(address indexed admin, uint256 amount);
+    event FeesHarvested(address indexed admin, uint256 amount);
+    event EnginePauseToggled(bool isPaused);
+    event BidPlaced(uint256 indexed slotId, address indexed bidder, uint256 bidAmount);
+    event ContentUpdated(uint256 indexed slotId, bytes32 newContentHash);
+    event DescriptorUpdated(string newDescriptor);
+
+    modifier onlyAdmin() {
+        require(msg.sender == auctionAdmin, "ZenithAd: Access denied");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!isEnginePaused, "ZenithAd: Engine paused");
+        _;
+    }
+
+    constructor() {
+        auctionAdmin = payable(msg.sender);
+        engineDescriptor = "Zenith Base Pixel Ad Auction Core v1";
+        platformFeeBps = 250; // 2.5%
+        isEnginePaused = false;
+    }
+
+    // 1. addAdSlot
+    function addAdSlot(uint256 startingBidWei, uint256 buyNowPriceWei) external onlyAdmin returns (uint256) {
+        require(buyNowPriceWei > startingBidWei, "ZenithAd: Invalid pricing");
+        
+        slotCounter++;
+        adSlots[slotCounter] = AdSlot({
+            currentOwner: payable(address(0)),
+            currentBidWei: startingBidWei,
+            buyNowPriceWei: buyNowPriceWei,
+            isActive: true,
+            contentHash: 0x0
+        });
+
+        emit SlotAdded(slotCounter, buyNowPriceWei);
+        return slotCounter;
+    }
+
+    // 2. buyAdSlotOutright
+    function buyAdSlotOutright(uint256 slotId, bytes32 contentHash) external payable whenNotPaused {
+        AdSlot storage slot = adSlots[slotId];
+        require(slotId > 0 && slotId <= slotCounter, "ZenithAd: Invalid ID");
+        require(slot.isActive, "ZenithAd: Slot inactive");
+        require(msg.value >= slot.buyNowPriceWei, "ZenithAd: Below buy-now price");
+
+        if (slot.currentOwner != address(0) && slot.currentBidWei > 0) {
+            pendingRefunds[slot.currentOwner] += slot.currentBidWei;
+        }
+
+        uint256 fee = (msg.value * platformFeeBps) / 10000;
+        accumulatedFees += fee;
+
+        slot.currentOwner = payable(msg.sender);
+        slot.currentBidWei = msg.value - fee;
+        slot.isActive = false; // Завершает аукцион для этого слота
+        slot.contentHash = contentHash;
+
+        emit SlotBoughtOutright(slotId, msg.sender, msg.value);
+    }
+
+    // 3. claimAuctionRefund
+    function claimAuctionRefund() external {
+        uint256 amount = pendingRefunds[msg.sender];
+        require(amount > 0, "ZenithAd: No refund available");
+
+        pendingRefunds[msg.sender] = 0;
+        (bool sent, ) = payable(msg.sender).call{value: amount}("");
+        require(sent, "ZenithAd: Refund failed");
+
+        emit RefundClaimed(msg.sender, amount);
+    }
+
+    // 4. drainAuctionTreasury
+    function drainAuctionTreasury() external onlyAdmin {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "ZenithAd: Zero balance");
+
+        accumulatedFees = 0;
+        (bool sent, ) = auctionAdmin.call{value: balance}("");
+        require(sent, "ZenithAd: Sweep failed");
+
+        emit TreasuryDrained(auctionAdmin, balance);
+    }
+
+    // 5. harvestAuctionFees
+    function harvestAuctionFees() external onlyAdmin {
+        uint256 amount = accumulatedFees;
+        require(amount > 0, "ZenithAd: Zero fees");
+
+        accumulatedFees = 0;
+        (bool sent, ) = auctionAdmin.call{value: amount}("");
+        require(sent, "ZenithAd: Harvest failed");
+
+        emit FeesHarvested(auctionAdmin, amount);
+    }
+
+    // 6. pauseAdEngine
+    function pauseAdEngine(bool isPaused) external onlyAdmin {
+        isEnginePaused = isPaused;
+        emit EnginePauseToggled(isPaused);
+    }
+
+    // 7. placeAdBid
+    function placeAdBid(uint256 slotId, bytes32 contentHash) external payable whenNotPaused {
+        AdSlot storage slot = adSlots[slotId];
+        require(slotId > 0 && slotId <= slotCounter, "ZenithAd: Invalid ID");
+        require(slot.isActive, "ZenithAd: Slot inactive");
+        require(msg.value > slot.currentBidWei, "ZenithAd: Bid too low");
+        require(msg.value < slot.buyNowPriceWei, "ZenithAd: Use buy-now instead");
+
+        if (slot.currentOwner != address(0) && slot.currentBidWei > 0) {
+            pendingRefunds[slot.currentOwner] += slot.currentBidWei;
+        }
+
+        uint256 fee = (msg.value * platformFeeBps) / 10000;
+        accumulatedFees += fee;
+
+        slot.currentOwner = payable(msg.sender);
+        slot.currentBidWei = msg.value - fee;
+        slot.contentHash = contentHash;
+
+        emit BidPlaced(slotId, msg.sender, msg.value);
+    }
+
+    // 8. updateAdContent
+    function updateAdContent(uint256 slotId, bytes32 newContentHash) external {
+        AdSlot storage slot = adSlots[slotId];
+        require(slotId > 0 && slotId <= slotCounter, "ZenithAd: Invalid ID");
+        require(msg.sender == slot.currentOwner, "ZenithAd: Not slot owner");
+
+        slot.contentHash = newContentHash;
+        emit ContentUpdated(slotId, newContentHash);
+    }
+
+    // 9. updateEngineDescriptor
+    function updateEngineDescriptor(string calldata newDescriptor) external onlyAdmin {
+        require(bytes(newDescriptor).length > 0, "ZenithAd: Empty string");
+        engineDescriptor = newDescriptor;
+        emit DescriptorUpdated(newDescriptor);
+    }
+
+    // Read-метод
+    function getSlotInfo(uint256 slotId) external view returns (
+        address currentOwner,
+        uint256 currentBidWei,
+        uint256 buyNowPriceWei,
+        bool isActive,
+        bytes32 contentHash
+    ) {
+        AdSlot memory s = adSlots[slotId];
+        return (s.currentOwner, s.currentBidWei, s.buyNowPriceWei, s.isActive, s.contentHash);
+    }
+}
